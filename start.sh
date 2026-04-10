@@ -1,2 +1,2 @@
 #!/bin/bash
-uvicorn app.main:app --host 0.0.0.0 --port 10000
+gunicorn app.main:app --workers 4 --worker-class uvicorn.workers.UvicornWorker --bind 0.0.0.0:10000
