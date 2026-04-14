@@ -102,21 +102,6 @@ def _resolve_counterparty(
             f"Counterparty '{raw_name.strip()}' could not be created or recovered. "
             "Please retry the request."
         ) from e
-def _validate_merged_financials(
-    acv_cents: int | None,
-    tcv_cents: int | None,
-) -> None:
-    """
-    Run AFTER merging request + DB values. Catches violations where only
-    one side was in the request but the combined result breaks the rule.
-    e.g. existing tcv=1000, request sends acv=1200 only → violation.
-    """
-    if acv_cents is not None and tcv_cents is not None:
-        if acv_cents > tcv_cents:
-            raise ContractValidationError(
-                f"acv_cents ({acv_cents}) cannot exceed tcv_cents ({tcv_cents}) "
-                "after applying this update."
-            )
 
 
 def _validate_merged_timeline(
@@ -152,8 +137,6 @@ def create_contract(
             counterparty_id=counterparty.id,
             title=request.title,
             type=request.type,
-            tcv_cents=request.financials.tcv_cents,
-            acv_cents=request.financials.acv_cents,
             currency=request.financials.currency,
             start_date=request.timeline.start_date,
             end_date=request.timeline.end_date,
@@ -245,15 +228,8 @@ def update_contract(
             fin        = request.financials
             fields_set = fin.model_fields_set
 
-            new_tcv = fin.tcv_cents if "tcv_cents" in fields_set else contract.tcv_cents
-            new_acv = fin.acv_cents if "acv_cents" in fields_set else contract.acv_cents
-            new_cur = fin.currency  if "currency"  in fields_set else contract.currency
-
-            _validate_merged_financials(new_acv, new_tcv)
-
-            contract.tcv_cents = new_tcv
-            contract.acv_cents = new_acv
-            contract.currency  = new_cur
+            if "currency" in fields_set:
+                contract.currency = fin.currency
 
         # ── 4. Timeline — merge then validate ─────────────────────────────────
         if request.timeline is not None:

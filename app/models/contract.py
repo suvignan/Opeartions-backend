@@ -18,10 +18,6 @@ class Contract(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "(acv_cents IS NULL OR tcv_cents IS NULL) OR (acv_cents <= tcv_cents)",
-            name="ck_contract_acv_lte_tcv",
-        ),
-        CheckConstraint(
             "end_date IS NULL OR end_date >= start_date",
             name="ck_contract_end_gte_start",
         ),
