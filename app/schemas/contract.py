@@ -5,26 +5,30 @@ from datetime import date, datetime
 from pydantic import BaseModel, field_validator, model_validator
 
 from app.core.enums import ContractStatus, Currency
+from app.core.project_types import get_allowed_project_types, is_valid_project_type
 from app.schemas.counterparty import CounterpartyCreate, CounterpartyInContract
 
 
 # ── Sub-schemas ────────────────────────────────────────────────────────────────
 
 class FinancialsSchema(BaseModel):
-    """
-    Request schema for contract financials.
-    TCV and ACV have been removed from input flows but remain in the DB.
-    """
-    currency: Currency = Currency.USD
-
-
-class FinancialsResponseSchema(BaseModel):
-    """
-    Response schema including historical TCV/ACV data.
-    """
     tcv_cents: int | None = None
     acv_cents: int | None = None
     currency: Currency = Currency.USD
+
+    @field_validator("tcv_cents", "acv_cents")
+    @classmethod
+    def must_be_positive(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("Financial values must be non-negative")
+        return v
+
+    @model_validator(mode="after")
+    def acv_lte_tcv(self) -> "FinancialsSchema":
+        if self.acv_cents is not None and self.tcv_cents is not None:
+            if self.acv_cents > self.tcv_cents:
+                raise ValueError("acv_cents cannot exceed tcv_cents")
+        return self
 
 
 class TimelineSchema(BaseModel):
@@ -41,12 +45,29 @@ class TimelineSchema(BaseModel):
 
 class UpdateFinancialsSchema(BaseModel):
     """
-    Update schema for financials.
-    Only currency remains updatable in this section.
+    All fields optional. Cross-field validation only runs when both
+    values are present in THIS request. Mixed-value validation
+    (one from request, one from DB) happens in the service layer.
     """
+    tcv_cents: int | None = None
+    acv_cents: int | None = None
     currency: Currency | None = None
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("tcv_cents", "acv_cents")
+    @classmethod
+    def must_be_positive(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("Financial values must be non-negative")
+        return v
+
+    @model_validator(mode="after")
+    def acv_lte_tcv(self) -> "UpdateFinancialsSchema":
+        if self.acv_cents is not None and self.tcv_cents is not None:
+            if self.acv_cents > self.tcv_cents:
+                raise ValueError("acv_cents cannot exceed tcv_cents")
+        return self
 
 
 class UpdateTimelineSchema(BaseModel):
@@ -80,6 +101,7 @@ class UpdateContractRequest(BaseModel):
     """
     title: str | None = None
     type: str | None = None
+    project_type: str | None = None
     counterparty_id: uuid.UUID | None = None
     counterparty: CounterpartyCreate | None = None
     financials: UpdateFinancialsSchema | None = None
@@ -102,16 +124,39 @@ class UpdateContractRequest(BaseModel):
         """True when the caller explicitly sent a counterparty field."""
         return self.counterparty_id is not None or self.counterparty is not None
 
+    @field_validator("project_type")
+    @classmethod
+    def validate_project_type(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not is_valid_project_type(value):
+            allowed = ", ".join(get_allowed_project_types())
+            raise ValueError(
+                f"Invalid project_type '{value}'. Allowed values: {allowed}."
+            )
+        return value
+
 
 # ── Request schemas ────────────────────────────────────────────────────────────
 
 class CreateContractRequest(BaseModel):
     title: str
     type: str | None = None
+    project_type: str
     counterparty_id: uuid.UUID | None = None
     counterparty: CounterpartyCreate | None = None
     financials: FinancialsSchema
     timeline: TimelineSchema
+
+    @field_validator("project_type")
+    @classmethod
+    def validate_project_type(cls, value: str) -> str:
+        if not is_valid_project_type(value):
+            allowed = ", ".join(get_allowed_project_types())
+            raise ValueError(
+                f"Invalid project_type '{value}'. Allowed values: {allowed}."
+            )
+        return value
 
     @model_validator(mode="after")
     def exactly_one_counterparty(self) -> "CreateContractRequest":
@@ -150,12 +195,14 @@ class AuditSchema(BaseModel):
 
 class ContractResponse(BaseModel):
     id: uuid.UUID
+    contract_code: str | None = None
     title: str
     type: str | None = None
+    project_type: str
     status: ContractStatus
     owner_id: uuid.UUID
     counterparty: CounterpartyInContract
-    financials: FinancialsResponseSchema
+    financials: FinancialsSchema
     timeline: TimelineSchema
     audit: AuditSchema
 
@@ -165,12 +212,14 @@ class ContractResponse(BaseModel):
     def from_orm_model(cls, contract) -> "ContractResponse":
         return cls(
             id=contract.id,
+            contract_code=getattr(contract, "contract_code", None),
             title=contract.title,
             type=contract.type,
+            project_type=contract.project_type,
             owner_id=contract.owner_id,
             status=contract.status,
             counterparty=CounterpartyInContract.model_validate(contract.counterparty),
-            financials=FinancialsResponseSchema(
+            financials=FinancialsSchema(
                 tcv_cents=contract.tcv_cents,
                 acv_cents=contract.acv_cents,
                 currency=contract.currency,

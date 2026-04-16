@@ -15,7 +15,10 @@ from app.core.exceptions import (
     DuplicateContractError,
     DuplicateCounterpartyError,
 )
+from app.core.project_types import get_project_type_code, get_company_code
 from app.schemas.contract import CreateContractRequest, ContractResponse,UpdateContractRequest
+
+MAX_CONTRACT_CODE_RETRIES = 5
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -102,6 +105,21 @@ def _resolve_counterparty(
             f"Counterparty '{raw_name.strip()}' could not be created or recovered. "
             "Please retry the request."
         ) from e
+def _validate_merged_financials(
+    acv_cents: int | None,
+    tcv_cents: int | None,
+) -> None:
+    """
+    Run AFTER merging request + DB values. Catches violations where only
+    one side was in the request but the combined result breaks the rule.
+    e.g. existing tcv=1000, request sends acv=1200 only → violation.
+    """
+    if acv_cents is not None and tcv_cents is not None:
+        if acv_cents > tcv_cents:
+            raise ContractValidationError(
+                f"acv_cents ({acv_cents}) cannot exceed tcv_cents ({tcv_cents}) "
+                "after applying this update."
+            )
 
 
 def _validate_merged_timeline(
@@ -119,6 +137,12 @@ def _validate_merged_timeline(
             "after applying this update."
         )
 
+
+def _is_contract_code_unique_conflict(error_str: str) -> bool:
+    return "uq_contract_contract_code" in error_str or (
+        "contract_code" in error_str and "unique" in error_str
+    )
+
 # ── Public service functions ───────────────────────────────────────────────────
 
 
@@ -129,26 +153,82 @@ def create_contract(
     actor_id: uuid.UUID | None = None,
 ) -> ContractResponse:
     try:
-        counterparty = _resolve_counterparty(db, owner_id, actor_id, request)
+        for attempt in range(MAX_CONTRACT_CODE_RETRIES):
+            try:
+                counterparty = _resolve_counterparty(db, owner_id, actor_id, request)
+                contract = Contract(
+                    id=uuid.uuid4(),
+                    owner_id=owner_id,
+                    counterparty_id=counterparty.id,
+                    title=request.title,
+                    type=request.type,
+                    project_type=request.project_type,
+                    tcv_cents=request.financials.tcv_cents,
+                    acv_cents=request.financials.acv_cents,
+                    currency=request.financials.currency,
+                    start_date=request.timeline.start_date,
+                    end_date=request.timeline.end_date,
+                    auto_renew=request.timeline.auto_renew,
+                    status=ContractStatus.PENDING_REVIEW,
+                    created_by=actor_id,
+                    updated_by=actor_id,
+                )
 
-        contract = Contract(
-            id=uuid.uuid4(),
-            owner_id=owner_id,
-            counterparty_id=counterparty.id,
-            title=request.title,
-            type=request.type,
-            currency=request.financials.currency,
-            start_date=request.timeline.start_date,
-            end_date=request.timeline.end_date,
-            auto_renew=request.timeline.auto_renew,
-            status=ContractStatus.PENDING_REVIEW,
-            created_by=actor_id,
-            updated_by=actor_id,
-        )
-        db.add(contract)
-        db.commit()
-        db.refresh(contract)
-        return ContractResponse.from_orm_model(contract)
+                print("DEBUG: starting contract_code generation")
+
+                last_contract = (
+                    db.query(Contract)
+                    .filter(Contract.contract_code != None)
+                    .order_by(Contract.created_at.desc())
+                    .first()
+                )
+
+                next_seq = 1
+
+                if last_contract and last_contract.contract_code:
+                    try:
+                        last_seq = int(last_contract.contract_code.split("_")[-1])
+                        next_seq = last_seq + 1
+                    except:
+                        next_seq = 1
+
+                try:
+                    short_code = get_project_type_code(contract.project_type)
+                except ValueError:
+                    short_code = "OTH"
+
+                    
+                company_code = get_company_code()
+                contract.contract_code = f"{company_code}_{short_code}_{next_seq:03d}"
+
+                print("DEBUG: generated contract_code =", contract.contract_code)
+
+                db.add(contract)
+                db.commit()
+                db.refresh(contract)
+                return ContractResponse.from_orm_model(contract)
+
+            except IntegrityError as e:
+                db.rollback()
+                error_str = str(e.orig).lower()
+
+                if "uq_contract_owner_counterparty_start" in error_str:
+                    raise DuplicateContractError(
+                        "A contract with this counterparty and start date already exists "
+                        "for your account."
+                    ) from e
+
+                if _is_contract_code_unique_conflict(error_str):
+                    if attempt < MAX_CONTRACT_CODE_RETRIES - 1:
+                        continue
+                    raise ContractValidationError(
+                        "Unable to generate a unique contract_code after retries. "
+                        "Please retry the request."
+                    ) from e
+
+                raise ContractValidationError(
+                    f"A database constraint was violated: {e.orig}"
+                ) from e
 
     except (
         CounterpartyNotFoundError,
@@ -159,18 +239,6 @@ def create_contract(
     ):
         db.rollback()
         raise
-
-    except IntegrityError as e:
-        db.rollback()
-        error_str = str(e.orig).lower()
-        if "uq_contract_owner_counterparty_start" in error_str:
-            raise DuplicateContractError(
-                "A contract with this counterparty and start date already exists "
-                "for your account."
-            ) from e
-        raise ContractValidationError(
-            f"A database constraint was violated: {e.orig}"
-        ) from e
 
     except Exception as e:
         db.rollback()
@@ -223,13 +291,23 @@ def update_contract(
         if "type" in fields_set:
             contract.type = request.type
 
+        if "project_type" in fields_set:
+            contract.project_type = request.project_type
+
         # ── 3. Financials — merge then validate ───────────────────────────────
         if request.financials is not None:
             fin        = request.financials
             fields_set = fin.model_fields_set
 
-            if "currency" in fields_set:
-                contract.currency = fin.currency
+            new_tcv = fin.tcv_cents if "tcv_cents" in fields_set else contract.tcv_cents
+            new_acv = fin.acv_cents if "acv_cents" in fields_set else contract.acv_cents
+            new_cur = fin.currency  if "currency"  in fields_set else contract.currency
+
+            _validate_merged_financials(new_acv, new_tcv)
+
+            contract.tcv_cents = new_tcv
+            contract.acv_cents = new_acv
+            contract.currency  = new_cur
 
         # ── 4. Timeline — merge then validate ─────────────────────────────────
         if request.timeline is not None:

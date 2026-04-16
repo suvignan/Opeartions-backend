@@ -1,6 +1,9 @@
 # app/models/contract.py
+from __future__ import annotations
+
 import uuid
 from datetime import date
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     String, Integer, Boolean, Date,
@@ -12,11 +15,22 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 from app.core.enums import ContractStatus
 
+if TYPE_CHECKING:
+    from app.models.counterparty import Counterparty
+
 
 class Contract(Base):
     __tablename__ = "contracts"
 
     __table_args__ = (
+        CheckConstraint(
+            "(acv_cents IS NULL OR tcv_cents IS NULL) OR (acv_cents <= tcv_cents)",
+            name="ck_contract_acv_lte_tcv",
+        ),
+        CheckConstraint(
+            "project_type IN ('WEB_APP','MOBILE_APP','ML_PROJECT','DATA_PIPELINE','OTHER')",
+            name="ck_contract_project_type_allowed",
+        ),
         CheckConstraint(
             "end_date IS NULL OR end_date >= start_date",
             name="ck_contract_end_gte_start",
@@ -61,6 +75,18 @@ class Contract(Base):
     # ── Core Details ───────────────────────────────────────────────────────────
     title: Mapped[str] = mapped_column(String(255), nullable=False, server_default=text("''"))
     type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    contract_code: Mapped[str | None] = mapped_column(
+        String(64),
+        unique=True,
+        index=True,
+        nullable=True,
+    )
+    project_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="OTHER",
+        server_default=text("'OTHER'"),
+    )
 
     # ── Timeline ───────────────────────────────────────────────────────────────
     start_date: Mapped[date] = mapped_column(Date, nullable=False)
