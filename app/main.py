@@ -1,6 +1,7 @@
 # app/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import inspect, text
 
 from app.db.session import engine
 from app.db.base import Base
@@ -32,6 +33,33 @@ def create_tables() -> None:
     Use Alembic migrations in production so schema changes are versioned.
     """
     Base.metadata.create_all(bind=engine)
+    _ensure_contract_columns()
+
+
+def _ensure_contract_columns() -> None:
+    inspector = inspect(engine)
+    existing_columns = {column["name"] for column in inspector.get_columns("contracts")}
+
+    with engine.begin() as conn:
+        if "project_type" not in existing_columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE contracts ADD COLUMN project_type VARCHAR(50) NOT NULL DEFAULT 'OTHER'"
+                )
+            )
+
+        if "contract_code" not in existing_columns:
+            conn.execute(
+                text(
+                    "ALTER TABLE contracts ADD COLUMN contract_code VARCHAR(64)"
+                )
+            )
+
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_contract_contract_code ON contracts (contract_code)"
+            )
+        )
 
 
 # Register routers
